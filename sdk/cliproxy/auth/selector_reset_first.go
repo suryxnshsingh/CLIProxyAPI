@@ -19,6 +19,12 @@ import (
 // usable snapshot (never used, or its window has already rolled over) is
 // picked first so one request reveals its reset time. Priority tiers and
 // cooldowns apply exactly as in FillFirstSelector; ties keep ID order.
+//
+// A credential that is nearly spent in either window (see lowHeadroom) moves
+// behind every credential with room left, so a long session lands on an
+// account that can finish it instead of hitting the limit mid-run. Because the
+// threshold is a share of the account's own window, a smaller plan (Max 5x)
+// reaches it sooner in absolute terms than a larger one (Max 20x).
 type ResetFirstSelector struct {
 	// nowFunc is overridable in tests.
 	nowFunc func() time.Time
@@ -38,13 +44,47 @@ func (s *ResetFirstSelector) Pick(ctx context.Context, provider, model string, o
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	best := available[0]
 	bestLong, bestShort := quotaResetTimes(best, now)
+	bestLow := lowHeadroom(best, now)
 	for _, candidate := range available[1:] {
 		long, short := quotaResetTimes(candidate, now)
+		low := lowHeadroom(candidate, now)
+		if low != bestLow {
+			if !low {
+				best, bestLong, bestShort, bestLow = candidate, long, short, low
+			}
+			continue
+		}
 		if resetEarlier(long, short, bestLong, bestShort) {
-			best, bestLong, bestShort = candidate, long, short
+			best, bestLong, bestShort, bestLow = candidate, long, short, low
 		}
 	}
 	return best, nil
+}
+
+// Utilization at or above which a window counts as nearly spent.
+const (
+	lowHeadroomShort = 0.90 // 5-hour window
+	lowHeadroomLong  = 0.95 // weekly window
+)
+
+// lowHeadroom reports whether the credential's last snapshot shows a usage
+// window that is still open and nearly spent. Unknown utilization is not low.
+func lowHeadroom(auth *Auth, now time.Time) bool {
+	if auth == nil || len(auth.Quota.Signals) == 0 {
+		return false
+	}
+	signals := auth.Quota.Signals
+	get := func(name string) string {
+		return strings.TrimSpace(signals[http.CanonicalHeaderKey(name)])
+	}
+	spent := func(window string, limit float64) bool {
+		util, err := strconv.ParseFloat(get("Anthropic-Ratelimit-Unified-"+window+"-Utilization"), 64)
+		if err != nil || util < limit {
+			return false
+		}
+		return parseEpochSeconds(get("Anthropic-Ratelimit-Unified-" + window + "-Reset")).After(now)
+	}
+	return spent("5h", lowHeadroomShort) || spent("7d", lowHeadroomLong)
 }
 
 // resetEarlier orders by long-window reset (unknown first), then short-window reset.

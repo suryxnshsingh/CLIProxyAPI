@@ -115,3 +115,42 @@ func TestQuotaResetTimes_Codex(t *testing.T) {
 		t.Fatalf("short = %v, want %v", short, now.Add(50*time.Minute))
 	}
 }
+
+func withUtil(a *Auth, window string, util string) *Auth {
+	a.Quota.Signals["Anthropic-Ratelimit-Unified-"+window+"-Utilization"] = util
+	return a
+}
+
+func TestResetFirstSelector_SkipsNearlySpentAccount(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_800_000_000, 0)
+	got := pickResetFirst(t, now,
+		withUtil(claudeAuth("a", now.Add(time.Hour), now.Add(2*time.Hour)), "5h", "0.93"),
+		claudeAuth("b", now.Add(3*24*time.Hour), now.Add(time.Hour)),
+	)
+	if got != "b" {
+		t.Fatalf("got %q, want b (a is nearly spent in its 5h window)", got)
+	}
+}
+
+func TestResetFirstSelector_NearlySpentStillUsedWhenAllAre(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_800_000_000, 0)
+	got := pickResetFirst(t, now,
+		withUtil(claudeAuth("a", now.Add(time.Hour), time.Time{}), "7d", "0.97"),
+		withUtil(claudeAuth("b", now.Add(3*24*time.Hour), time.Time{}), "7d", "0.99"),
+	)
+	if got != "a" {
+		t.Fatalf("got %q, want a (soonest reset among low accounts)", got)
+	}
+}
+
+func TestResetFirstSelector_ExpiredWindowUtilizationIgnored(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_800_000_000, 0)
+	a := withUtil(claudeAuth("a", now.Add(time.Hour), now.Add(-time.Minute)), "5h", "1.0")
+	got := pickResetFirst(t, now, a, claudeAuth("b", now.Add(3*24*time.Hour), time.Time{}))
+	if got != "a" {
+		t.Fatalf("got %q, want a (its 5h window already reset)", got)
+	}
+}
